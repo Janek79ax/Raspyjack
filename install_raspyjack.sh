@@ -541,6 +541,27 @@ UNIT
   sudo systemctl enable raspyjack-pin-wifi.service
 fi
 
+# Ensure WiFi radio is enabled AFTER NetworkManager starts.
+# NM overrides rfkill with its persisted WirelessEnabled state, so the
+# pin service (Before=NM) cannot guarantee radio is on.
+step "Installing post-NM WiFi radio enable service …"
+sudo tee /etc/systemd/system/raspyjack-wifi-radio.service >/dev/null <<'UNIT'
+[Unit]
+Description=RaspyJack Enable WiFi Radio
+After=NetworkManager.service
+Requires=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nmcli radio wifi on
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable raspyjack-wifi-radio.service
+
 # ───── 5 ▸ RaspyJack core service ────────────────────────────
 SERVICE=/etc/systemd/system/raspyjack.service
 step "Checking core systemd services …"

@@ -4887,6 +4887,11 @@ def _check_payload_request():
 
 
 def main():
+    subprocess.run(["rfkill", "unblock", "wifi"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["nmcli", "radio", "wifi", "on"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     # Draw background once
     try:
         draw_lock.acquire()

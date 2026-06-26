@@ -172,7 +172,7 @@ From a fresh Raspberry Pi OS Lite install:
 sudo apt update
 sudo apt install -y git
 sudo -i
-git clone https://github.com/7h30th3r0n3/raspyjack.git Raspyjack
+git clone https://github.com/Janek79ax/raspyjack.git Raspyjack
 cd Raspyjack
 chmod +x install_raspyjack.sh
 ./install_raspyjack.sh
@@ -189,7 +189,7 @@ After reboot, RaspyJack should be available on-device.
 sudo -i
 cd /root
 rm -rf Raspyjack
-git clone https://github.com/7h30th3r0n3/raspyjack.git Raspyjack
+git clone https://github.com/Janek79ax/raspyjack.git Raspyjack
 cd Raspyjack
 chmod +x install_raspyjack.sh
 ./install_raspyjack.sh

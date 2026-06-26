@@ -96,7 +96,14 @@ class WiFiManager:
         
         self.log(f"Final detected WiFi interfaces: {interfaces}")
         return interfaces
-    
+
+    def _ensure_radio_on(self):
+        """Ensure NetworkManager has WiFi radio enabled (Bookworm soft-blocks by default)."""
+        subprocess.run(['rfkill', 'unblock', 'wifi'],
+                       capture_output=True, check=False)
+        subprocess.run(['nmcli', 'radio', 'wifi', 'on'],
+                       capture_output=True, check=False)
+
     def scan_networks(self, interface=None):
         """Scan for available WiFi networks using nmcli (same tool as connect)."""
         if not interface:
@@ -107,6 +114,7 @@ class WiFiManager:
             return []
 
         try:
+            self._ensure_radio_on()
             self.log(f"Scanning networks on {interface}...")
 
             # Trigger a fresh scan on the interface
@@ -236,6 +244,7 @@ class WiFiManager:
             self.log("No WiFi interface available")
             return False
 
+        self._ensure_radio_on()
         self.log(f"Connecting to {ssid} on {interface}...")
 
         try:

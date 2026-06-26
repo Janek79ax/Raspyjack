@@ -39,6 +39,20 @@ done
 detect_ifaces
 log "detected onboard=${ONBOARD_IF:-none} usb=${USB_IF:-none}"
 
+# Unblock WiFi radios early (Bookworm soft-blocks by default).
+rfkill unblock wifi 2>/dev/null || true
+
+# Unblock bluetooth radios early (Bookworm soft-blocks by default).
+rfkill unblock bluetooth 2>/dev/null || true
+
+# Tell NetworkManager to enable WiFi radio (NM overrides rfkill with its
+# persisted WirelessEnabled state, so rfkill alone is not enough).
+nmcli radio wifi on 2>/dev/null || true
+
+# Bring detected interfaces up (best effort).
+ip link show wlan0 >/dev/null 2>&1 && ip link set wlan0 up >/dev/null 2>&1 || true
+ip link show wlan1 >/dev/null 2>&1 && ip link set wlan1 up >/dev/null 2>&1 || true
+
 # Nothing to do if no onboard WiFi was detected.
 if [ -z "${ONBOARD_IF:-}" ]; then
   log "no onboard iface detected, exit"
@@ -84,9 +98,11 @@ if ip link show wlan_tmp0 >/dev/null 2>&1 && ! ip link show wlan1 >/dev/null 2>&
   ip link set wlan_tmp0 name wlan1 >/dev/null 2>&1 || true
 fi
 
-# Bring final interfaces up (best effort).
+# Bring renamed interfaces up.
 ip link show wlan0 >/dev/null 2>&1 && ip link set wlan0 up >/dev/null 2>&1 || true
 ip link show wlan1 >/dev/null 2>&1 && ip link set wlan1 up >/dev/null 2>&1 || true
+
+nmcli radio wifi on 2>/dev/null || true
 
 detect_ifaces
 log "after rename onboard=${ONBOARD_IF:-none} usb=${USB_IF:-none}"

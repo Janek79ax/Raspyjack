@@ -197,6 +197,11 @@ def setup_monitor_mode(iface):
     """Enable monitor mode on *iface*. Returns (success, mon_iface_name)."""
     log(f"Setting up monitor mode on {iface}")
 
+    # Unblock WiFi via rfkill (soft-block prevents monitor mode silently)
+    rfkill_result = run_command("rfkill unblock wifi")
+    log(f"rfkill unblock wifi: {rfkill_result}")
+    time.sleep(0.5)
+
     # Unmanage from NetworkManager, kill wpa_supplicant for this iface only
     run_command(f"nmcli device set {iface} managed no")
     run_command(f"pkill -f 'wpa_supplicant.*{iface}'")
