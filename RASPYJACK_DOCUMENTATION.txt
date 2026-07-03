@@ -1,4 +1,2241 @@
 ================================================================================
+RASPYJACK PROJECT DOCUMENTATION
+================================================================================
+Generated: 2026-07-03
+Language: English
+Scope: Current repository scan, with emphasis on payload behavior and usage.
+
+This document describes the current RaspyJack project, its payload runtime, the
+hardware and Linux integrations used by payloads, and the complete payload
+catalog discovered under payloads/.
+
+Repository scan summary:
+- Python files under payloads/: 318
+- Executable payloads: 305
+- Helper modules hidden from the launcher: files starting with "_"
+- Payload discovery model: filesystem based; no manifest is required.
+
+Legal and operational note:
+RaspyJack contains offensive security tooling. Use payloads only in systems,
+radio space, networks, and devices where you have explicit authorization.
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+RaspyJack is a portable Raspberry Pi offensive security toolkit with:
+- A physical LCD menu driven by GPIO buttons.
+- A WebUI dashboard and live screen mirror.
+- A browser Payload IDE for viewing, editing, and launching payloads.
+- A filesystem-based payload launcher.
+- Loot collection under loot/.
+- Integrations with Linux networking tools, WiFi adapters, Bluetooth, GPS, NFC,
+  SDR hardware, USB gadget mode, JanOS ESP32-C5 firmware, and external services.
+
+Core files:
+- raspyjack.py: main device UI, menu, payload discovery, payload execution.
+- web_server.py: HTTP server, payload list/start/status APIs, Payload IDE routes.
+- device_server.py: WebSocket screen mirror and input forwarding.
+- rj_input.py: virtual button bridge used by WebUI and payloads.
+- LCD_1in44.py / LCD_Config.py: LCD driver and SPI/GPIO configuration.
+- payloads/: standalone Python payloads grouped by category.
+- payloads/_input_helper.py: unified GPIO + WebUI input helper.
+- payloads/_display_helper.py: scaled drawing helper for 128/240/Cardputer layouts.
+- payloads/_keyboard_helper.py: LCD text entry helper.
+- payloads/_iface_helper.py: network interface detection and LCD interface picker.
+- payloads/_gps_helper.py: GPS autodetection and gpsd startup.
+- payloads/_janos_helper.py: UART transport for JanOS ESP32-C5 firmware.
+- payloads/sdr/_sdr_core.py: RTL-SDR / SoapySDR abstraction.
+- EXTENSIONS/: optional trigger/action helper API.
+- DNSSpoof/: phishing/captive portal site templates.
+- Responder/: vendored Responder stack.
+- vendor/ragnar/: vendored Ragnar stack controlled by the Ragnar payload.
+
+================================================================================
+2. PAYLOAD RUNTIME MODEL
+================================================================================
+
+Payload discovery:
+- raspyjack.py walks payloads/ recursively.
+- Only .py files are included.
+- Files whose names start with "_" are helper modules and are not launchable.
+- Hidden directories and __pycache__ are skipped.
+- The first path segment is the category.
+- Root-level payloads, if any, are treated as "general".
+- Subdirectories become nested folders in the LCD payload menu.
+
+Launch paths:
+- LCD: Main Menu -> Payload -> category -> payload.
+- WebUI: payload list/start APIs write a request file read by raspyjack.py.
+- Payload IDE: browser editor can save and run payload files.
+- Favorites: loot/Favorites/favorites.json injects selected payloads into the main menu.
+- Autostart: loot/Autostart/autostart.json launches one payload on boot.
+- Utility launchers: payload_scheduler, button_combo, and some manager payloads can
+  launch or coordinate other payloads.
+
+Execution lifecycle:
+1. raspyjack.py resolves the selected file under payloads/.
+2. It writes /dev/shm/rj_payload_state.json with running=true and the payload path.
+3. It sets screen_lock so the main UI stops drawing.
+4. It clears the LCD.
+5. It runs python3 <payload> as a blocking subprocess.
+6. stdout and stderr are appended to loot/payload.log.
+7. On exit, raspyjack.py rewrites payload state to idle.
+8. GPIO and LCD are reinitialized.
+9. The main menu is redrawn.
+
+Important runtime constraints:
+- Only one foreground payload owns the LCD and buttons at a time.
+- The parent menu is blocked while a payload runs.
+- WebUI Stop is cooperative: it sends the KEY3 virtual button. Payloads must poll
+  get_button() and exit on KEY3.
+- Payloads should use KEY3 as the universal exit/back action.
+- Payloads should clean up LCD, GPIO, network modes, subprocesses, and temporary
+  services before returning to the menu.
+
+Display and input:
+- The LCD driver mirrors frames to /dev/shm/raspyjack_last.jpg for WebUI streaming.
+- Payloads that call LCD.LCD_ShowImage() automatically appear in the WebUI mirror.
+- _input_helper.get_button() checks WebUI virtual buttons first, then GPIO.
+- _input_helper respects the display flip setting from gui_conf.json.
+- _keyboard_helper.lcd_keyboard() supports text entry on the LCD and remote text
+  sessions where supported.
+
+Standard controls:
+- UP/DOWN/LEFT/RIGHT: navigate, scroll, move cursor, or adjust values.
+- OK: confirm, select, start, pause, or activate focused item.
+- KEY1: mode switch or primary secondary action.
+- KEY2: stop sub-action, reset, backspace, or alternate action.
+- KEY3: mandatory exit to the RaspyJack menu.
+
+Common output locations:
+- loot/payload.log: captured stdout/stderr from payload subprocesses.
+- loot/Handshakes/: WPA handshakes and related WiFi captures.
+- loot/NFC/: saved NFC dumps and card data.
+- loot/SDR/: SDR and Sub-GHz captures.
+- loot/GoodPortal/, loot/Favorites/, loot/Autostart/: payload-specific state.
+- config/: payload configuration files and profiles.
+
+================================================================================
+3. HARDWARE AND LINUX INTEGRATION
+================================================================================
+
+Baseline device:
+- Raspberry Pi running Linux.
+- Waveshare-style LCD HAT or compatible display.
+- GPIO buttons using BCM pins:
+  UP=6, DOWN=19, LEFT=5, RIGHT=26, OK=13, KEY1=21, KEY2=20, KEY3=16.
+
+Display support:
+- ST7735 128x128.
+- ST7789 240x240.
+- Cardputer-style 320x170 profile.
+- Payload UI should be designed in 128-base coordinates and scaled using
+  _display_helper.ScaledDraw and scaled_font.
+
+Privilege assumptions:
+- RaspyJack services and payloads are expected to run as root.
+- Many payloads need CAP_NET_RAW, CAP_NET_ADMIN, monitor mode, iptables, raw
+  sockets, Bluetooth HCI access, USB gadget configuration, or systemd control.
+
+Dual WiFi policy:
+- Onboard Pi WiFi is reserved for normal connectivity and WebUI access.
+- External USB WiFi adapters are used for monitor mode, packet injection, AP mode,
+  deauth, capture, captive portal, and evil twin workflows.
+- _iface_helper sorts USB WiFi before onboard WiFi and can require monitor support.
+- Preferred adapter families include RTL8812AU/RTL88XXAU, AR9271/ath9k_htc,
+  MT7921U, RTL8188EUS, and related monitor-capable chipsets.
+
+Monitor mode pattern:
+- rfkill unblock wifi.
+- Unmanage the attack interface with NetworkManager when possible.
+- Stop per-interface wpa_supplicant interference.
+- Switch interface type with iw, or fall back to airmon-ng.
+- Verify whether the active interface is iface or ifacemon.
+- Restore managed mode and NetworkManager after the attack.
+
+AP/captive portal pattern:
+- Use hostapd for AP mode.
+- Use dnsmasq for DHCP/DNS.
+- Use iptables/nft/sysctl for routing or captive behavior when needed.
+- Kill or clean stale hostapd/dnsmasq instances on exit.
+
+Bluetooth:
+- Uses BlueZ, hci0 by default, bluetoothctl, hciconfig, hcitool, l2ping, bleak,
+  and bluepy depending on payload.
+- Some raw HCI payloads temporarily stop bluetoothd.
+
+GPS:
+- _gps_helper scans /dev/serial/by-id, ttyACM*, ttyUSB*, ttyS*, and ttyAMA*.
+- It detects NMEA output, releases serial-getty on UART GPS, and starts gpsd -n.
+- Wardriving and hardware GPS payloads consume gpsd output.
+
+JanOS ESP32-C5:
+- wifi/janos_c5.py controls ESP32-C5 JanOS firmware over UART.
+- JanOS performs WiFi/BLE RF work; RaspyJack is the LCD controller and command UI.
+- Commands include ping, scan_networks, select_networks, start_deauth, stop,
+  start_blackout, start_sniffer, show_sniffer_results, scan_bt.
+
+NFC/RFID:
+- NFC payloads use PN532 or compatible readers via helper modules.
+- Workflows include scanning, dumping, cracking, writing, formatting, and browsing
+  saved card data.
+
+SDR/Sub-GHz:
+- SDR payloads use RTL-SDR, rtl_sdr, rtl_433, rtl_fm, dump1090, multimon-ng, and
+  optional SoapySDR/HackRF style backends.
+- _sdr_core kills stale rtl_* processes before starting a new SDR session.
+
+USB:
+- USB payloads use USB host monitoring, USB gadget mode, HID gadget, mass storage
+  gadget, USB Ethernet, and evdev where available.
+
+================================================================================
+4. USING PAYLOADS
+================================================================================
+
+On device:
+1. Boot RaspyJack and wait for the main LCD menu.
+2. Select Payload.
+3. Choose a category.
+4. Select the payload.
+5. Follow the on-screen controls.
+6. Press KEY3 to exit.
+7. Review loot files or loot/payload.log if the payload reports an error.
+
+From WebUI:
+1. Open the RaspyJack WebUI from the device IP.
+2. Use the Payload panel or Payload IDE.
+3. Start a payload by path.
+4. Watch the live LCD mirror.
+5. Use virtual controls; Stop sends KEY3.
+
+When to prefer WebUI:
+- Longer text entry.
+- Monitoring a payload while the device is not physically accessible.
+- Editing or testing payloads through the Payload IDE.
+
+When to prefer the device LCD:
+- Field operation.
+- Quick confirmation/control loops.
+- Payloads that require physical proximity to WiFi/BLE/NFC/Sub-GHz targets.
+
+================================================================================
+5. COMPLETE PAYLOAD CATALOG
+================================================================================
+
+The catalog below lists every executable payload discovered in the current tree.
+For each payload, "Use when" explains why it exists and when an operator would
+choose it. "How it works" summarizes the main implementation approach and
+dependencies without replacing the source as the final authority.
+
+--------------------------------------------------------------------------------
+5.1 RECONNAISSANCE (50)
+--------------------------------------------------------------------------------
+
+ad_recon.py
+  Path: payloads/reconnaissance/ad_recon.py
+  What it does: Enumerates Active Directory users, groups, trusts, SPNs, and
+  exposed domain services.
+  How it works: Prompts for domain/controller details and uses LDAP, SMB/RPC,
+  enum4linux-style checks, and nmap where available.
+  Use when: You are connected to an authorized Windows domain network and need a
+  compact domain reconnaissance workflow.
+
+analyzer.py
+  Path: payloads/reconnaissance/analyzer.py
+  What it does: Shows a live WiFi/BLE RF activity analyzer on the LCD.
+  How it works: Uses monitor-capable WiFi and Bluetooth capture data to render
+  activity bands, channel changes, and sparkline-style indicators.
+  Use when: You need a quick local view of RF density and channel activity.
+
+ap_hackstats.py
+  Path: payloads/reconnaissance/ap_hackstats.py
+  What it does: Displays access point attack statistics from existing loot.
+  How it works: Parses capture and attack result files under loot/.
+  Use when: You want a field dashboard of AP-focused activity already collected.
+
+arp_scan_stealth.py
+  Path: payloads/reconnaissance/arp_scan_stealth.py
+  What it does: Performs low-noise ARP-based host discovery.
+  How it works: Sends controlled ARP probes instead of a loud full port scan.
+  Use when: You need a cautious first look at a local subnet.
+
+auto_recon.py
+  Path: payloads/reconnaissance/auto_recon.py
+  What it does: Runs a drop-box style automated reconnaissance chain.
+  How it works: Selects an interface, identifies the local network, and runs
+  staged discovery, service, DNS, and HTTP checks.
+  Use when: You want hands-off initial recon after connecting RaspyJack to a LAN.
+
+autoNmapScan.py
+  Path: payloads/reconnaissance/autoNmapScan.py
+  What it does: Runs recurring or manual nmap scans.
+  How it works: Schedules nmap scans and stores output in loot.
+  Use when: You need periodic visibility into a network during an engagement.
+
+bloodhound_collector.py
+  Path: payloads/reconnaissance/bloodhound_collector.py
+  What it does: Collects Active Directory data suitable for BloodHound analysis.
+  How it works: Uses bloodhound-python or LDAP fallbacks with supplied domain
+  credentials and controller details.
+  Use when: You have authorization to map AD relationships and attack paths.
+
+bt_scan_classic.py
+  Path: payloads/reconnaissance/bt_scan_classic.py
+  What it does: Scans for Bluetooth Classic devices.
+  How it works: Uses hcitool/bluetoothctl style discovery through the BlueZ stack.
+  Use when: You need nearby classic Bluetooth device visibility.
+
+cam_finder.py
+  Path: payloads/reconnaissance/cam_finder.py
+  What it does: Finds likely wireless cameras.
+  How it works: Looks for camera SSIDs, OUIs, and wireless signatures with a
+  monitor-capable WiFi adapter.
+  Use when: You are auditing hidden or unmanaged camera presence.
+
+cctv_scanner.py
+  Path: payloads/reconnaissance/cctv_scanner.py
+  What it does: Scans a subnet for IP cameras and CCTV services.
+  How it works: Probes common RTSP/HTTP ports and vendor fingerprints.
+  Use when: You need to inventory camera endpoints on a wired or WiFi network.
+
+cctv_viewer.py
+  Path: payloads/reconnaissance/cctv_viewer.py
+  What it does: Views discovered CCTV streams on the LCD.
+  How it works: Reads stream URLs and uses ffmpeg/RTSP decoding into LCD frames.
+  Use when: You need to validate camera stream exposure on-site.
+
+cert_scanner.py
+  Path: payloads/reconnaissance/cert_scanner.py
+  What it does: Enumerates and summarizes TLS certificates.
+  How it works: Connects to TLS services with openssl/socket checks.
+  Use when: You are checking certificate subjects, expiry, issuers, and service
+  identity from the device.
+
+client_hackstats.py
+  Path: payloads/reconnaissance/client_hackstats.py
+  What it does: Displays per-client WiFi attack/capture statistics.
+  How it works: Parses loot from wireless capture and deauth workflows.
+  Use when: You want client-focused progress during WiFi assessments.
+
+curly.py
+  Path: payloads/reconnaissance/curly.py
+  What it does: Provides interactive HTTP probing.
+  How it works: Uses LCD text input and curl-style requests for methods, headers,
+  and paths.
+  Use when: You need quick web endpoint checks without leaving the device.
+
+device_scout.py
+  Path: payloads/reconnaissance/device_scout.py
+  What it does: Tracks WiFi/BLE devices and persistence scores.
+  How it works: Monitors RF observations and maintains per-device state.
+  Use when: You need to detect recurring nearby devices.
+
+dns_leaker.py
+  Path: payloads/reconnaissance/dns_leaker.py
+  What it does: Passively observes DNS/NBNS-style name leakage.
+  How it works: Sniffs local traffic and extracts query names.
+  Use when: You want to see what hosts are trying to resolve on a LAN.
+
+eternalblue_checker.py
+  Path: payloads/reconnaissance/eternalblue_checker.py
+  What it does: Checks SMB hosts for MS17-010 exposure.
+  How it works: Runs the nmap smb-vuln-ms17-010 script against selected targets.
+  Use when: You are validating legacy Windows SMB risk.
+
+ethernet_recon.py
+  Path: payloads/reconnaissance/ethernet_recon.py
+  What it does: Discovers Ethernet link and neighbor information.
+  How it works: Uses ethtool, LLDP/CDP-style observations, ip, and sysfs data.
+  Use when: You plug RaspyJack into a switch port and need local link context.
+
+examine_ap.py
+  Path: payloads/reconnaissance/examine_ap.py
+  What it does: Performs a focused deep dive on one WiFi AP.
+  How it works: Captures AP/client/channel/encryption data with a monitor adapter.
+  Use when: You need to inspect one wireless target before choosing an attack.
+
+flock_detect.py
+  Path: payloads/reconnaissance/flock_detect.py
+  What it does: Detects coordinated groups of devices moving together.
+  How it works: Correlates repeated WiFi/BLE observations into flock scores.
+  Use when: You are looking for tracking clusters or coordinated device presence.
+
+gatt_enum.py
+  Path: payloads/reconnaissance/gatt_enum.py
+  What it does: Enumerates BLE GATT services and characteristics.
+  How it works: Connects to a target BLE MAC using BlueZ/Bleak/gatttool patterns.
+  Use when: You are authorized to inspect a BLE peripheral's exposed surface.
+
+glasses_detector.py
+  Path: payloads/reconnaissance/glasses_detector.py
+  What it does: Detects smart glasses BLE signatures.
+  How it works: Scans BLE advertisements and compares names, UUIDs, and vendor
+  patterns.
+  Use when: You want awareness of nearby smart glasses or recording devices.
+
+gobuster_dir.py
+  Path: payloads/reconnaissance/gobuster_dir.py
+  What it does: Performs web directory brute forcing.
+  How it works: Wraps gobuster dir with LCD input for target and wordlist.
+  Use when: You need lightweight content discovery against an authorized web host.
+
+handshake_quality.py
+  Path: payloads/reconnaissance/handshake_quality.py
+  What it does: Rates WPA handshake capture quality.
+  How it works: Parses cap/pcapng files and EAPOL content with aircrack/scapy
+  style validation.
+  Use when: You need to know whether a captured handshake is worth cracking.
+
+honeypot.py
+  Path: payloads/reconnaissance/honeypot.py
+  What it does: Runs a multi-port TCP honeypot.
+  How it works: Starts Python listeners, records connection attempts, and shows
+  activity on the LCD.
+  Use when: You want to observe unsolicited local network probes.
+
+jelly_sentinel.py
+  Path: payloads/reconnaissance/jelly_sentinel.py
+  What it does: Runs a passive traffic sentinel dashboard.
+  How it works: Captures interface traffic and summarizes protocol/activity stats.
+  Use when: You need a passive situational awareness screen.
+
+ldap_dumper.py
+  Path: payloads/reconnaissance/ldap_dumper.py
+  What it does: Dumps LDAP directory information.
+  How it works: Uses ldapsearch with anonymous or authenticated bind details.
+  Use when: You are auditing exposed LDAP data in an authorized environment.
+
+livecam_detector.py
+  Path: payloads/reconnaissance/livecam_detector.py
+  What it does: Detects likely live streaming cameras.
+  How it works: Probes ports, banners, RTSP paths, and camera-specific patterns.
+  Use when: You need to locate live video services on a network.
+
+mac_lookup.py
+  Path: payloads/reconnaissance/mac_lookup.py
+  What it does: Looks up MAC address vendors.
+  How it works: Uses OUI lookup data or online lookup if available.
+  Use when: You need quick vendor identification for observed devices.
+
+mdns_scanner.py
+  Path: payloads/reconnaissance/mdns_scanner.py
+  What it does: Discovers mDNS/Bonjour services.
+  How it works: Uses multicast service discovery through avahi/scapy style probes.
+  Use when: You want service names and device hints without a port scan.
+
+navarro.py
+  Path: payloads/reconnaissance/navarro.py
+  What it does: Runs OSINT username checks across many platforms.
+  How it works: Wraps the Navarro CLI and shows progress/results on the LCD.
+  Use when: You are validating username exposure for an authorized identity.
+
+network_mapper.py
+  Path: payloads/reconnaissance/network_mapper.py
+  What it does: Builds a visual map of hosts and services.
+  How it works: Combines ARP/nmap/traceroute-style data into a topology view.
+  Use when: You need a field-friendly network overview.
+
+norse_recon.py
+  Path: payloads/reconnaissance/norse_recon.py
+  What it does: Shows a combined WiFi, BLE, and connection dashboard.
+  How it works: Aggregates iw, Bluetooth scan, IP/socket, and local status data.
+  Use when: You want a single situational awareness screen.
+
+osint_username.py
+  Path: payloads/reconnaissance/osint_username.py
+  What it does: Checks username presence across common websites.
+  How it works: Sends HTTP requests and interprets status/content patterns.
+  Use when: You need quick username OSINT from the device.
+
+passive_os_detect.py
+  Path: payloads/reconnaissance/passive_os_detect.py
+  What it does: Passively fingerprints operating systems.
+  How it works: Inspects TTL, TCP window, options, and other packet traits.
+  Use when: You want OS hints without active probing.
+
+rtsp_viewer.py
+  Path: payloads/reconnaissance/rtsp_viewer.py
+  What it does: Displays RTSP streams on the LCD.
+  How it works: Uses ffmpeg to decode frames and renders downscaled images.
+  Use when: You need to verify an RTSP endpoint visually.
+
+service_banner.py
+  Path: payloads/reconnaissance/service_banner.py
+  What it does: Grabs service banners from selected ports.
+  How it works: Uses socket connections and nmap -sV style detection.
+  Use when: You want quick service identity before deeper scanning.
+
+shodan_query.py
+  Path: payloads/reconnaissance/shodan_query.py
+  What it does: Queries Shodan InternetDB for IP intelligence.
+  How it works: Uses HTTPS requests to internetdb.shodan.io without an API key.
+  Use when: You want external exposure context for an IP address.
+
+smb_probe.py
+  Path: payloads/reconnaissance/smb_probe.py
+  What it does: Finds SMB hosts.
+  How it works: Scans port 445 and reports responsive systems.
+  Use when: You need to identify Windows/Samba targets.
+
+smb_share_crawler.py
+  Path: payloads/reconnaissance/smb_share_crawler.py
+  What it does: Enumerates and crawls SMB shares.
+  How it works: Uses smbclient/enum4linux-style access with supplied credentials.
+  Use when: You are auditing share exposure and accessible files.
+
+sniff_creds_live.py
+  Path: payloads/reconnaissance/sniff_creds_live.py
+  What it does: Shows live credential events gathered by sniffers or Responder.
+  How it works: Tails/parses credential logs and displays recent hits.
+  Use when: You need a quick live credential capture dashboard during an authorized
+  assessment.
+
+spycam_detector.py
+  Path: payloads/reconnaissance/spycam_detector.py
+  What it does: Searches for hidden camera indicators.
+  How it works: Combines wireless SSID/OUI/vendor patterns and capture tools.
+  Use when: You are auditing spaces for unauthorized camera devices.
+
+subnet_mapper.py
+  Path: payloads/reconnaissance/subnet_mapper.py
+  What it does: Maps live hosts in a subnet.
+  How it works: Uses ARP/ping sweep style probing and summarizes live nodes.
+  Use when: You need an immediate local host inventory.
+
+trig_mac.py
+  Path: payloads/reconnaissance/trig_mac.py
+  What it does: Alerts when watched MAC addresses appear or disappear.
+  How it works: Monitors WiFi/BLE observations against a watchlist.
+  Use when: You need proximity triggers for known devices.
+
+vlan_map.py
+  Path: payloads/reconnaissance/vlan_map.py
+  What it does: Discovers VLAN IDs on a connected network.
+  How it works: Uses 802.1Q tagged probes and packet capture on Ethernet.
+  Use when: You are testing switch port/trunk exposure.
+
+wall_of_flippers.py
+  Path: payloads/reconnaissance/wall_of_flippers.py
+  What it does: Detects Flipper Zero and similar BLE/RF gadget signatures.
+  How it works: Scans BLE advertisements, names, UUIDs, and known patterns.
+  Use when: You want awareness of nearby hacking gadgets.
+
+wardriving.py
+  Path: payloads/reconnaissance/wardriving.py
+  What it does: Maps WiFi networks with optional GPS.
+  How it works: Uses monitor mode, raw packet capture, gpsd, SQLite, and Wigle
+  export formats.
+  Use when: You are building a wireless coverage and AP inventory map.
+
+wardriving_replay.py
+  Path: payloads/reconnaissance/wardriving_replay.py
+  What it does: Replays a saved wardriving session on the LCD.
+  How it works: Reads wardriving SQLite/CSV data and animates or browses results.
+  Use when: You want to review captured WiFi survey data offline.
+
+wifi_client_map.py
+  Path: payloads/reconnaissance/wifi_client_map.py
+  What it does: Maps WiFi clients to access points.
+  How it works: Captures association/probe/data frames in monitor mode.
+  Use when: You need to understand which clients are tied to which APs.
+
+whois_lookup.py
+  Path: payloads/reconnaissance/whois_lookup.py
+  What it does: Runs WHOIS and reverse DNS lookups.
+  How it works: Wraps whois/dig style lookups from LCD-entered domains or IPs.
+  Use when: You need ownership and DNS context while in the field.
+
+--------------------------------------------------------------------------------
+5.2 WIFI (20)
+--------------------------------------------------------------------------------
+
+captive_portal.py
+  Path: payloads/wifi/captive_portal.py
+  What it does: Creates a rogue AP with captive portal credential capture.
+  How it works: Runs hostapd, dnsmasq, and a Python HTTP portal using templates
+  from DNSSpoof/sites/.
+  Use when: You are performing an authorized captive portal/social engineering
+  simulation. Requires an AP-capable USB WiFi adapter.
+
+ciw_zeroclick.py
+  Path: payloads/wifi/ciw_zeroclick.py
+  What it does: Provides a CIW zero-click WiFi attack research workflow.
+  How it works: Uses selected target AP parameters and monitor/injection tooling.
+  Use when: You are testing CIW-specific wireless behavior in a lab.
+
+dead_drop.py
+  Path: payloads/wifi/dead_drop.py
+  What it does: Hosts an offline WiFi file dead drop.
+  How it works: Creates an AP with DHCP/DNS and a small HTTP file share.
+  Use when: You need local file transfer without upstream internet.
+
+deauth.py
+  Path: payloads/wifi/deauth.py
+  What it does: Performs WiFi deauthentication and optional handshake capture.
+  How it works: Selects a monitor-capable adapter, scans APs/clients, then uses
+  aireplay-ng or Scapy deauth frames and EAPOL capture.
+  Use when: You are auditing client/AP resilience or capturing authorized WPA
+  handshakes. Requires injection-capable external WiFi.
+
+espnow_evil_master.py
+  Path: payloads/wifi/espnow_evil_master.py
+  What it does: Monitors or captures ESP-NOW traffic.
+  How it works: Uses monitor mode and Scapy-like packet parsing on selected channels.
+  Use when: You are assessing ESP-NOW device traffic in a lab.
+
+evil_twin.py
+  Path: payloads/wifi/evil_twin.py
+  What it does: Clones a target AP as an evil twin.
+  How it works: Uses hostapd/dnsmasq for the clone AP and may coordinate deauth
+  against the legitimate AP.
+  Use when: You are running an authorized rogue AP simulation. Best with separate
+  AP-mode and monitor-mode adapters.
+
+event_triggers.py
+  Path: payloads/wifi/event_triggers.py
+  What it does: Runs WiFi event-based automation.
+  How it works: Sniffs wireless events and maps matched conditions to configured
+  actions.
+  Use when: You want payload actions triggered by SSID/BSSID/client events.
+
+handshake_hunter.py
+  Path: payloads/wifi/handshake_hunter.py
+  What it does: Hunts WPA handshakes across selected networks.
+  How it works: Uses airodump/deauth assistance and stores capture files.
+  Use when: You need a focused handshake collection workflow.
+
+janos_c5.py
+  Path: payloads/wifi/janos_c5.py
+  What it does: Controls JanOS ESP32-C5 firmware from RaspyJack.
+  How it works: Detects a UART device, sends JanOS CLI commands, and displays
+  WiFi/BLE scan, deauth, blackout, and sniffer results.
+  Use when: You want to offload WiFi/BLE RF operations to an ESP32-C5.
+
+karma_ap.py
+  Path: payloads/wifi/karma_ap.py
+  What it does: Runs a KARMA-style AP that responds to probe requests.
+  How it works: Uses AP/monitor capabilities and hostapd-like responses to SSID
+  probes.
+  Use when: You are testing client auto-join behavior in an authorized lab.
+
+pmkid_grab.py
+  Path: payloads/wifi/pmkid_grab.py
+  What it does: Captures PMKID hashes from WPA networks.
+  How it works: Uses hcxdumptool/hcxpcapngtool style capture and conversion.
+  Use when: You need clientless WPA hash collection where supported.
+
+raspygotchi.py
+  Path: payloads/wifi/raspygotchi.py
+  What it does: Provides a Pwnagotchi-like handshake hunting persona.
+  How it works: Channel hops, monitors EAPOL, optionally deauths, and shows a
+  personality/status UI.
+  Use when: You want autonomous wireless capture behavior with LCD feedback.
+
+ssid_pool.py
+  Path: payloads/wifi/ssid_pool.py
+  What it does: Manages SSID lists for beacon/KARMA-style payloads.
+  How it works: Edits and stores SSID pools used by wireless attack workflows.
+  Use when: You need reusable SSID sets for wireless simulations.
+
+unitree_pwn.py
+  Path: payloads/wifi/unitree_pwn.py
+  What it does: Tests Unitree robot network exposure and known issues.
+  How it works: Connects to a Unitree network and checks SSH/UDP/control-plane
+  behavior.
+  Use when: You are auditing owned or authorized Unitree robotics devices.
+
+wifi_alert.py
+  Path: payloads/wifi/wifi_alert.py
+  What it does: Alerts on watched WiFi MACs or SSIDs.
+  How it works: Monitors frames in monitor mode and optionally sends webhook alerts.
+  Use when: You need RF watchlist notifications.
+
+wifi_handshake_auto.py
+  Path: payloads/wifi/wifi_handshake_auto.py
+  What it does: Automatically captures WPA handshakes on association events.
+  How it works: Sniffs EAPOL and can assist with deauth depending on settings.
+  Use when: You want unattended handshake capture on 2.4 GHz targets.
+
+wifi_probe_dump.py
+  Path: payloads/wifi/wifi_probe_dump.py
+  What it does: Captures WiFi probe requests.
+  How it works: Uses monitor mode or tshark-like capture to log client probe SSIDs.
+  Use when: You are auditing probe leakage and client behavior.
+
+wifi_survey.py
+  Path: payloads/wifi/wifi_survey.py
+  What it does: Shows a WiFi survey dashboard.
+  How it works: Uses airodump/iw data to display APs, channels, signal, and security.
+  Use when: You need a quick wireless environment survey.
+
+wpa_enterprise_evil.py
+  Path: payloads/wifi/wpa_enterprise_evil.py
+  What it does: Runs an evil twin workflow for WPA-Enterprise.
+  How it works: Uses hostapd, fake RADIUS behavior, dnsmasq, and AP-mode WiFi.
+  Use when: You are testing enterprise WiFi client validation and EAP behavior.
+
+wps_pixie.py
+  Path: payloads/wifi/wps_pixie.py
+  What it does: Tests WPS Pixie Dust and brute-force exposure.
+  How it works: Wraps reaver/bully/wash style tooling against a selected BSSID.
+  Use when: You are auditing WPS risk on authorized APs.
+
+--------------------------------------------------------------------------------
+5.3 NETWORK (37)
+--------------------------------------------------------------------------------
+
+antenna_check.py
+  Path: payloads/network/antenna_check.py
+  What it does: Diagnoses WiFi antenna and adapter signal behavior.
+  How it works: Reads iw/iwconfig/signal statistics for selected interfaces.
+  Use when: You need to verify adapter reception before WiFi work.
+
+arp_dos.py
+  Path: payloads/network/arp_dos.py
+  What it does: Performs ARP-based denial-of-service testing.
+  How it works: Sends high-volume ARP frames to stress a network segment.
+  Use when: You are validating switch/LAN resilience in a lab.
+
+arp_mitm.py
+  Path: payloads/network/arp_mitm.py
+  What it does: Runs ARP man-in-the-middle with forwarding and capture.
+  How it works: Uses arpspoof/iptables/tcpdump or Scapy poisoning.
+  Use when: You are authorized to intercept local traffic for testing.
+
+arp_spoof.py
+  Path: payloads/network/arp_spoof.py
+  What it does: Performs ARP cache poisoning.
+  How it works: Sends crafted ARP replies to selected hosts.
+  Use when: You need a focused ARP spoofing test.
+
+cdp_spoof.py
+  Path: payloads/network/cdp_spoof.py
+  What it does: Spoofs Cisco Discovery Protocol frames.
+  How it works: Crafts CDP packets with selected device identity fields.
+  Use when: You are testing switch neighbor trust and monitoring.
+
+dhcp_snoop.py
+  Path: payloads/network/dhcp_snoop.py
+  What it does: Passively observes DHCP traffic.
+  How it works: Sniffs UDP 67/68 and summarizes leases/options.
+  Use when: You need DHCP server and client visibility.
+
+dhcp_starve.py
+  Path: payloads/network/dhcp_starve.py
+  What it does: Tests DHCP starvation conditions.
+  How it works: Sends many DHCP Discover requests with varied client IDs/MACs.
+  Use when: You are validating DHCP snooping or pool exhaustion defenses.
+
+dhcpv6_rogue.py
+  Path: payloads/network/dhcpv6_rogue.py
+  What it does: Runs a rogue DHCPv6 server.
+  How it works: Advertises IPv6 addressing/DNS options with dnsmasq/Scapy.
+  Use when: You are testing IPv6 rogue service exposure.
+
+dns_hijack.py
+  Path: payloads/network/dns_hijack.py
+  What it does: Spoofs DNS responses in an interception position.
+  How it works: Uses Scapy DNS response injection and firewall redirection.
+  Use when: You are validating DNS trust and client behavior.
+
+dragon_drain.py
+  Path: payloads/network/dragon_drain.py
+  What it does: Tests WPA3-SAE Dragonfly denial-of-service behavior.
+  How it works: Uses monitor-capable WiFi and DragonDrain tooling against a target.
+  Use when: You are auditing WPA3 AP resilience.
+
+firewall_switcher.py
+  Path: payloads/network/firewall_switcher.py
+  What it does: Switches local firewall profiles.
+  How it works: Applies iptables/nftables rule presets.
+  Use when: You need quick device-side firewall mode changes.
+
+goodportal.py
+  Path: payloads/network/goodportal.py
+  What it does: Runs a MAC-whitelist DNS portal.
+  How it works: Uses dnsmasq/iptables and loot/GoodPortal/whitelist.json.
+  Use when: You want controlled portal access for selected clients.
+
+hsrp_takeover.py
+  Path: payloads/network/hsrp_takeover.py
+  What it does: Tests HSRP priority takeover.
+  How it works: Crafts HSRP packets with selected group/VIP/priority values.
+  Use when: You are auditing first-hop redundancy protocol trust.
+
+icmp_redirect.py
+  Path: payloads/network/icmp_redirect.py
+  What it does: Injects ICMP redirect messages.
+  How it works: Sends crafted ICMP redirect packets to selected victims.
+  Use when: You are testing client acceptance of ICMP route manipulation.
+
+igmp_snoop.py
+  Path: payloads/network/igmp_snoop.py
+  What it does: Observes IGMP multicast membership.
+  How it works: Sniffs IGMP packets and summarizes multicast group joins/leaves.
+  Use when: You are auditing multicast behavior.
+
+ipv6_ra_attack.py
+  Path: payloads/network/ipv6_ra_attack.py
+  What it does: Sends rogue IPv6 Router Advertisements.
+  How it works: Crafts ICMPv6 RA messages with prefix and DNS options.
+  Use when: You are testing IPv6 RA guard and client behavior.
+
+llmnr_query_inject.py
+  Path: payloads/network/llmnr_query_inject.py
+  What it does: Injects LLMNR/NBT-NS queries.
+  How it works: Uses Scapy to generate local name-resolution traffic.
+  Use when: You need to trigger or test name-resolution responder workflows.
+
+lldp_recon.py
+  Path: payloads/network/lldp_recon.py
+  What it does: Discovers LLDP/CDP neighbor information.
+  How it works: Listens for LLDP/CDP packets and may use tcpdump.
+  Use when: You need switch/port identity from a wired connection.
+
+mdns_poison.py
+  Path: payloads/network/mdns_poison.py
+  What it does: Sends spoofed mDNS responses.
+  How it works: Crafts multicast DNS answers for selected names/services.
+  Use when: You are testing multicast name-resolution trust.
+
+nac_bypass.py
+  Path: payloads/network/nac_bypass.py
+  What it does: Assists 802.1X/NAC bypass testing via transparent bridging.
+  How it works: Bridges two Ethernet interfaces while minimizing IP presence.
+  Use when: You have a dual-Ethernet device and authorization to test NAC controls.
+
+nbns_spoof.py
+  Path: payloads/network/nbns_spoof.py
+  What it does: Spoofs NetBIOS Name Service responses.
+  How it works: Watches NBNS queries and replies with controlled IP mappings.
+  Use when: You are testing legacy Windows name-resolution risk.
+
+net_doctor.py
+  Path: payloads/network/net_doctor.py
+  What it does: Provides a network troubleshooting wizard.
+  How it works: Runs ping, traceroute, ip, dig, and interface checks.
+  Use when: You need to debug connectivity from the device.
+
+network_tap.py
+  Path: payloads/network/network_tap.py
+  What it does: Creates an inline network tap with statistics.
+  How it works: Bridges two interfaces and captures traffic with tcpdump-like tools.
+  Use when: You have two Ethernet ports and need passive/inline observation.
+
+paper_pusher.py
+  Path: payloads/network/paper_pusher.py
+  What it does: Sends print jobs to network printers.
+  How it works: Talks to IPP/JetDirect-style printer endpoints.
+  Use when: You are testing printer exposure and job acceptance.
+
+port_scanner.py
+  Path: payloads/network/port_scanner.py
+  What it does: Scans TCP/UDP ports.
+  How it works: Uses nmap or socket scans based on target and mode.
+  Use when: You need a quick service exposure check.
+
+proxy_arp.py
+  Path: payloads/network/proxy_arp.py
+  What it does: Enables proxy ARP behavior.
+  How it works: Uses sysctl/interface settings and ARP handling.
+  Use when: You are testing subnet extension or routing assumptions.
+
+rogue_dhcp_wpad.py
+  Path: payloads/network/rogue_dhcp_wpad.py
+  What it does: Provides rogue DHCP with WPAD PAC injection.
+  How it works: Runs dnsmasq and a small HTTP PAC server.
+  Use when: You are auditing WPAD and DHCP trust in a lab.
+
+rogue_gateway.py
+  Path: payloads/network/rogue_gateway.py
+  What it does: Attempts to become a default gateway.
+  How it works: Uses DHCP/NAT/firewall configuration to offer gateway services.
+  Use when: You are testing rogue gateway exposure.
+
+silent_bridge.py
+  Path: payloads/network/silent_bridge.py
+  What it does: Runs a stealth transparent bridge.
+  How it works: Auto-selects two interfaces, bridges them, and captures traffic.
+  Use when: You need inline observation with minimal active behavior.
+
+ssdp_spoof.py
+  Path: payloads/network/ssdp_spoof.py
+  What it does: Spoofs SSDP/UPnP devices.
+  How it works: Sends multicast SSDP responses with selected device templates.
+  Use when: You are testing UPnP discovery trust.
+
+stp_root_claim.py
+  Path: payloads/network/stp_root_claim.py
+  What it does: Tests STP root bridge takeover.
+  How it works: Crafts BPDUs with low bridge priority.
+  Use when: You are auditing spanning tree protections.
+
+syn_flood.py
+  Path: payloads/network/syn_flood.py
+  What it does: Performs SYN flood testing.
+  How it works: Generates TCP SYN traffic toward a selected host/port.
+  Use when: You are validating lab DoS resilience.
+
+tcp_rst_inject.py
+  Path: payloads/network/tcp_rst_inject.py
+  What it does: Injects TCP reset packets.
+  How it works: Matches flows and sends crafted RST packets.
+  Use when: You are testing session disruption in an authorized environment.
+
+traffic_analyzer.py
+  Path: payloads/network/traffic_analyzer.py
+  What it does: Shows live protocol traffic breakdown.
+  How it works: Uses tshark/tcpdump or packet parsing to count protocol activity.
+  Use when: You need quick local traffic profiling.
+
+trunk_dump.py
+  Path: payloads/network/trunk_dump.py
+  What it does: Captures VLAN trunk traffic.
+  How it works: Uses tcpdump with VLAN awareness on a trunk-capable Ethernet link.
+  Use when: You are auditing trunk exposure.
+
+vlan_hopper.py
+  Path: payloads/network/vlan_hopper.py
+  What it does: Tests VLAN hopping with double tagging.
+  How it works: Crafts 802.1Q tagged frames.
+  Use when: You are validating VLAN segmentation controls.
+
+wpad_proxy.py
+  Path: payloads/network/wpad_proxy.py
+  What it does: Runs WPAD proxy injection tooling.
+  How it works: Serves a PAC file and advertises WPAD via DHCP/DNS paths.
+  Use when: You are testing proxy auto-discovery trust.
+
+--------------------------------------------------------------------------------
+5.4 CREDENTIALS (12)
+--------------------------------------------------------------------------------
+
+cred_sniffer_multi.py
+  Path: payloads/credentials/cred_sniffer_multi.py
+  What it does: Sniffs credentials across multiple plaintext protocols.
+  How it works: Parses FTP, Telnet, HTTP, SMTP, and related traffic from an
+  interface or MITM position.
+  Use when: You are auditing plaintext credential exposure.
+
+default_creds_scanner.py
+  Path: payloads/credentials/default_creds_scanner.py
+  What it does: Tests default credentials on services.
+  How it works: Uses hydra/socket login attempts against selected services.
+  Use when: You are checking known default login risk.
+
+ftp_bruteforce.py
+  Path: payloads/credentials/ftp_bruteforce.py
+  What it does: Performs FTP password testing.
+  How it works: Uses hydra or Python FTP login attempts with a wordlist.
+  Use when: You are auditing authorized FTP credential strength.
+
+http_cred_sniffer.py
+  Path: payloads/credentials/http_cred_sniffer.py
+  What it does: Extracts HTTP credentials.
+  How it works: Parses Basic/Digest headers and form submissions from traffic.
+  Use when: You are testing for plaintext web authentication leakage.
+
+kerberoast.py
+  Path: payloads/credentials/kerberoast.py
+  What it does: Runs Kerberoast and AS-REP roast workflows.
+  How it works: Uses Impacket GetUserSPNs/GetNPUsers with domain details.
+  Use when: You are auditing Active Directory service account exposure.
+
+ntlm_cracker.py
+  Path: payloads/credentials/ntlm_cracker.py
+  What it does: Cracks NTLM hashes from capture logs.
+  How it works: Feeds hashes and wordlists to hashcat or john where installed.
+  Use when: You need to validate captured NTLM hash strength.
+
+ntlm_relay.py
+  Path: payloads/credentials/ntlm_relay.py
+  What it does: Runs NTLM relay workflows.
+  How it works: Coordinates ntlmrelayx and Responder-related behavior.
+  Use when: You are testing SMB/HTTP relay exposure with authorization.
+
+pass_the_hash.py
+  Path: payloads/credentials/pass_the_hash.py
+  What it does: Tests pass-the-hash lateral movement.
+  How it works: Uses Impacket psexec/wmiexec/smbexec style tools with supplied
+  target and hash data.
+  Use when: You are validating Windows hash reuse risk.
+
+snmp_walk.py
+  Path: payloads/credentials/snmp_walk.py
+  What it does: Brute-tests SNMP community strings and walks exposed data.
+  How it works: Uses onesixtyone/snmpwalk style tools.
+  Use when: You are auditing SNMP exposure and weak communities.
+
+ssh_bruteforce.py
+  Path: payloads/credentials/ssh_bruteforce.py
+  What it does: Tests SSH passwords.
+  How it works: Uses hydra or paramiko with selected usernames and wordlists.
+  Use when: You are validating SSH credential policy.
+
+telnet_grabber.py
+  Path: payloads/credentials/telnet_grabber.py
+  What it does: Grabs Telnet banners and tests default credentials.
+  How it works: Opens Telnet sessions and attempts known default login pairs.
+  Use when: You are auditing legacy Telnet services.
+
+wpa_cracker.py
+  Path: payloads/credentials/wpa_cracker.py
+  What it does: Cracks WPA handshakes.
+  How it works: Uses aircrack-ng/hashcat with capture files and wordlists.
+  Use when: You need to validate WiFi passphrase strength from authorized captures.
+
+--------------------------------------------------------------------------------
+5.5 BLUETOOTH (9)
+--------------------------------------------------------------------------------
+
+ble_beacon_flood.py
+  Path: payloads/bluetooth/ble_beacon_flood.py
+  What it does: Floods BLE scanners with fake beacon names.
+  How it works: Uses hcitool/hciconfig advertising commands through hci0.
+  Use when: You are testing BLE scanner resilience in a controlled environment.
+
+ble_mitm.py
+  Path: payloads/bluetooth/ble_mitm.py
+  What it does: Proxies BLE GATT traffic for MITM research.
+  How it works: Uses BLE libraries to sit between a central and peripheral.
+  Use when: You are analyzing BLE application-layer behavior in a lab.
+
+ble_replay.py
+  Path: payloads/bluetooth/ble_replay.py
+  What it does: Replays captured BLE GATT writes.
+  How it works: Loads capture data and writes characteristics via BLE tooling.
+  Use when: You are testing BLE command replay protections.
+
+ble_scanner.py
+  Path: payloads/bluetooth/ble_scanner.py
+  What it does: Continuously scans BLE devices.
+  How it works: Uses hcitool/bluetoothctl/Bleak-style discovery and LCD display.
+  Use when: You need nearby BLE inventory.
+
+ble_spam.py
+  Path: payloads/bluetooth/ble_spam.py
+  What it does: Emits pairing/nearby-device spam patterns.
+  How it works: Sends advertising payloads for Fast Pair, iOS, Windows, or all
+  modes.
+  Use when: You are testing client notification behavior in a lab.
+
+bt_audio_inject.py
+  Path: payloads/bluetooth/bt_audio_inject.py
+  What it does: Connects to an A2DP speaker and plays audio.
+  How it works: Uses bluetoothctl and PulseAudio/BlueALSA-style playback.
+  Use when: You are testing Bluetooth speaker pairing and audio exposure.
+
+bt_dos.py
+  Path: payloads/bluetooth/bt_dos.py
+  What it does: Performs Bluetooth L2CAP ping flood testing.
+  How it works: Uses l2ping with configurable packet behavior.
+  Use when: You are validating Bluetooth DoS resilience in a lab.
+
+glasses_counter.py
+  Path: payloads/bluetooth/glasses_counter.py
+  What it does: Runs counter-actions against smart glasses BLE behavior.
+  How it works: Detects and interacts with smart-glasses BLE signatures.
+  Use when: You are researching smart-glasses presence and mitigation.
+
+whisperpair.py
+  Path: payloads/bluetooth/whisperpair.py
+  What it does: Tests WhisperPair-related BLE pairing behavior.
+  How it works: Uses BLE pairing interaction patterns against a selected target.
+  Use when: You are validating BLE pairing exposure in an authorized lab.
+
+--------------------------------------------------------------------------------
+5.6 USB (6)
+--------------------------------------------------------------------------------
+
+badusb_detector.py
+  Path: payloads/usb/badusb_detector.py
+  What it does: Detects suspicious USB keyboard injection behavior.
+  How it works: Watches USB/evdev events for high-rate or suspicious keystrokes.
+  Use when: You want local BadUSB detection on the RaspyJack host.
+
+ducky_library.py
+  Path: payloads/usb/ducky_library.py
+  What it does: Manages and launches DuckyScript-style HID scripts.
+  How it works: Stores scripts in loot and uses USB HID gadget behavior.
+  Use when: You are managing authorized HID automation scripts.
+
+hid_injector.py
+  Path: payloads/usb/hid_injector.py
+  What it does: Sends USB HID keystrokes.
+  How it works: Writes prepared keystroke events to /dev/hidg0 in gadget mode.
+  Use when: You need authorized USB HID automation from the Pi.
+
+usb_ethernet_mitm.py
+  Path: payloads/usb/usb_ethernet_mitm.py
+  What it does: Builds a USB Ethernet MITM bridge.
+  How it works: Uses bridge/firewall/capture tools around USB Ethernet interfaces.
+  Use when: You are testing traffic through a USB Ethernet path.
+
+usb_keylogger.py
+  Path: payloads/usb/usb_keylogger.py
+  What it does: Logs USB keyboard input.
+  How it works: Reads evdev events from attached keyboards.
+  Use when: You are auditing physical input exposure in an authorized setup.
+
+usb_mass_storage.py
+  Path: payloads/usb/usb_mass_storage.py
+  What it does: Presents the Pi as USB mass storage.
+  How it works: Configures g_mass_storage or configfs gadget backing storage.
+  Use when: You need USB storage gadget behavior for lab workflows.
+
+--------------------------------------------------------------------------------
+5.7 EXFILTRATION (12)
+--------------------------------------------------------------------------------
+
+auto_loot_exfil.py
+  Path: payloads/exfiltration/auto_loot_exfil.py
+  What it does: Watches loot/ and exfiltrates newly created files.
+  How it works: Maintains an exfiltrated manifest and uploads via configured HTTP,
+  Discord, DNS, or related channels.
+  Use when: You need automated delivery of authorized engagement artifacts.
+
+ble_exfil.py
+  Path: payloads/exfiltration/ble_exfil.py
+  What it does: Sends file data through BLE advertisements.
+  How it works: Chunks data into manufacturer-data advertisements using raw HCI.
+  Use when: You are testing low-bandwidth covert BLE transfer in a lab.
+
+dns_tunnel.py
+  Path: payloads/exfiltration/dns_tunnel.py
+  What it does: Exfiltrates data in DNS queries.
+  How it works: Encodes chunks into subdomains for a controlled domain.
+  Use when: You are validating DNS monitoring controls with authorization.
+
+dropbox_upload.py
+  Path: payloads/exfiltration/dropbox_upload.py
+  What it does: Uploads loot to Dropbox.
+  How it works: Uses Dropbox API credentials/configuration.
+  Use when: You want cloud upload of engagement artifacts.
+
+exfil_ftp.py
+  Path: payloads/exfiltration/exfil_ftp.py
+  What it does: Starts an FTP server for retrieving loot.
+  How it works: Uses pyftpdlib/vsftpd-style behavior with configured access.
+  Use when: You need a simple pull-based loot retrieval channel.
+
+exfil_smb.py
+  Path: payloads/exfiltration/exfil_smb.py
+  What it does: Pushes loot to a remote SMB share.
+  How it works: Uses smbclient or Impacket with share credentials.
+  Use when: You need to deliver artifacts to an internal file share.
+
+exfil_usb.py
+  Path: payloads/exfiltration/exfil_usb.py
+  What it does: Copies loot to inserted USB storage.
+  How it works: Detects/mounts USB media and copies files.
+  Use when: You want offline physical retrieval of results.
+
+exfiltrate_discord.py
+  Path: payloads/exfiltration/exfiltrate_discord.py
+  What it does: Zips and uploads loot/Responder logs to Discord.
+  How it works: Uses a webhook URL from config or discord_webhook.txt.
+  Use when: You want quick remote artifact delivery to a controlled Discord webhook.
+
+http_exfil.py
+  Path: payloads/exfiltration/http_exfil.py
+  What it does: Sends loot using chunked HTTP POSTs.
+  How it works: Base64-encodes file chunks and posts JSON to a configured endpoint.
+  Use when: You need a controlled HTTP upload channel.
+
+icmp_tunnel.py
+  Path: payloads/exfiltration/icmp_tunnel.py
+  What it does: Sends data through ICMP echo traffic.
+  How it works: Encodes chunks into ICMP packets with Scapy.
+  Use when: You are testing ICMP egress monitoring.
+
+reverse_ducky.py
+  Path: payloads/exfiltration/reverse_ducky.py
+  What it does: Generates reverse-shell DuckyScript content.
+  How it works: Combines LHOST/LPORT and target shell templates into HID scripts.
+  Use when: You need an authorized USB HID payload template.
+
+wdgwars_upload.py
+  Path: payloads/exfiltration/wdgwars_upload.py
+  What it does: Uploads handshakes to the WDGoWars platform.
+  How it works: Uses configured API credentials and HTTPS upload.
+  Use when: You participate in WDGoWars-style handshake workflows.
+
+--------------------------------------------------------------------------------
+5.8 EVASION (6)
+--------------------------------------------------------------------------------
+
+fingerprint_spoof.py
+  Path: payloads/evasion/fingerprint_spoof.py
+  What it does: Spoofs TCP/IP stack fingerprint traits.
+  How it works: Adjusts firewall and kernel/network parameters.
+  Use when: You are testing passive fingerprinting assumptions.
+
+log_cleaner.py
+  Path: payloads/evasion/log_cleaner.py
+  What it does: Removes or truncates selected local traces.
+  How it works: Edits/truncates configured log paths.
+  Use when: You are cleaning lab artifacts on a device you control.
+
+mac_randomizer.py
+  Path: payloads/evasion/mac_randomizer.py
+  What it does: Randomizes interface MAC addresses.
+  How it works: Brings interfaces down, sets MACs via ip/macchanger, and restores.
+  Use when: You need privacy or test identity rotation on authorized interfaces.
+
+stealth_mode.py
+  Path: payloads/evasion/stealth_mode.py
+  What it does: Toggles a stealth device profile.
+  How it works: Disables selected services, changes MAC behavior, and reduces
+  visible network presence.
+  Use when: You want RaspyJack to be less chatty on a network.
+
+timing_evasion.py
+  Path: payloads/evasion/timing_evasion.py
+  What it does: Randomizes attack timing.
+  How it works: Adds jitter and randomized delays around repeated actions.
+  Use when: You are testing timing-based detection sensitivity.
+
+traffic_shaper.py
+  Path: payloads/evasion/traffic_shaper.py
+  What it does: Shapes or delays traffic.
+  How it works: Uses Linux tc and related queueing controls.
+  Use when: You need to simulate constrained or evasive traffic patterns.
+
+--------------------------------------------------------------------------------
+5.9 REMOTE ACCESS (9)
+--------------------------------------------------------------------------------
+
+pagecord.py
+  Path: payloads/remote_access/pagecord.py
+  What it does: Provides Discord bot based C2/status interaction.
+  How it works: Uses Discord API tokens and channel configuration.
+  Use when: You need controlled remote interaction through Discord.
+
+persistence_planter.py
+  Path: payloads/remote_access/persistence_planter.py
+  What it does: Tests Windows persistence planting methods.
+  How it works: Uses schtasks, registry, service, SMB, and Impacket-style methods.
+  Use when: You are validating persistence controls on authorized Windows systems.
+
+pivot_proxy.py
+  Path: payloads/remote_access/pivot_proxy.py
+  What it does: Starts a SOCKS5 pivot proxy.
+  How it works: Listens locally and relays TCP streams.
+  Use when: You need an authorized pivot point through RaspyJack.
+
+port_forwarder.py
+  Path: payloads/remote_access/port_forwarder.py
+  What it does: Manages port forwards and tunnels.
+  How it works: Uses socat/iptables DNAT style forwarding.
+  Use when: You need simple local/remote TCP forwarding.
+
+reverse_shell_gen.py
+  Path: payloads/remote_access/reverse_shell_gen.py
+  What it does: Generates reverse shell one-liners.
+  How it works: Combines LHOST/LPORT with shell templates.
+  Use when: You need a reference command for an authorized test.
+
+reverse_ssh.py
+  Path: payloads/remote_access/reverse_ssh.py
+  What it does: Maintains a reverse SSH tunnel.
+  How it works: Uses ssh/autossh and configured remote host/key settings.
+  Use when: You need persistent remote access to the RaspyJack device.
+
+shell.py
+  Path: payloads/remote_access/shell.py
+  What it does: Provides an interactive shell on the LCD with keyboard input.
+  How it works: Uses pty and evdev/keyboard input to drive /bin/bash.
+  Use when: You need local command access without SSH.
+
+stealthlink.py
+  Path: payloads/remote_access/stealthlink.py
+  What it does: Runs an HTTPS polling reverse shell/C2 agent.
+  How it works: Polls configured HTTPS endpoints for commands and posts results.
+  Use when: You are testing controlled polling C2 behavior.
+
+tailscale_control.py
+  Path: payloads/remote_access/tailscale_control.py
+  What it does: Starts, stops, and checks Tailscale.
+  How it works: Wraps tailscale up/down/status.
+  Use when: You need VPN overlay access management from the LCD.
+
+--------------------------------------------------------------------------------
+5.10 NFC/RFID (14)
+--------------------------------------------------------------------------------
+
+nfc_amiibo.py
+  Path: payloads/nfc_rfid/nfc_amiibo.py
+  What it does: Reads or clones Amiibo/NTAG215-style tags.
+  How it works: Uses PN532 NFC access and saved dump files.
+  Use when: You are working with owned Amiibo-compatible NFC tags.
+
+nfc_bruteforce.py
+  Path: payloads/nfc_rfid/nfc_bruteforce.py
+  What it does: Brute-forces MIFARE keys.
+  How it works: Uses mfoc/mfcuk/PN532 flows with sector/key dictionaries.
+  Use when: You are auditing MIFARE key strength on authorized tags.
+
+nfc_cloner.py
+  Path: payloads/nfc_rfid/nfc_cloner.py
+  What it does: Clones NFC tag data to a writable tag.
+  How it works: Reads a source tag and writes to compatible writable/magic tags.
+  Use when: You need controlled backup/clone testing.
+
+nfc_crack.py
+  Path: payloads/nfc_rfid/nfc_crack.py
+  What it does: Cracks MIFARE Classic keys.
+  How it works: Runs nested/key recovery workflows with PN532-compatible tooling.
+  Use when: You are auditing MIFARE Classic access control.
+
+nfc_emv.py
+  Path: payloads/nfc_rfid/nfc_emv.py
+  What it does: Reads EMV payment card metadata.
+  How it works: Sends ISO14443-4/APDU queries and displays non-sensitive metadata.
+  Use when: You are testing NFC reader behavior with your own cards.
+
+nfc_format.py
+  Path: payloads/nfc_rfid/nfc_format.py
+  What it does: Formats or erases writable NFC tags.
+  How it works: Sends PN532 write/format commands.
+  Use when: You need to reset test tags.
+
+nfc_fuzzer.py
+  Path: payloads/nfc_rfid/nfc_fuzzer.py
+  What it does: Fuzzes NFC tag/protocol interactions.
+  How it works: Sends varied raw commands through the NFC driver.
+  Use when: You are testing NFC reader/tag robustness in a lab.
+
+nfc_hotel.py
+  Path: payloads/nfc_rfid/nfc_hotel.py
+  What it does: Analyzes hotel key card style NFC data.
+  How it works: Reads MIFARE/NFC structures and compares known patterns.
+  Use when: You are auditing authorized hotel/access-card systems.
+
+nfc_magic.py
+  Path: payloads/nfc_rfid/nfc_magic.py
+  What it does: Manages magic UID tags.
+  How it works: Writes UID and block data to compatible magic tags.
+  Use when: You are testing clone workflows with lab tags.
+
+nfc_ndef_writer.py
+  Path: payloads/nfc_rfid/nfc_ndef_writer.py
+  What it does: Writes NDEF records.
+  How it works: Uses LCD text entry to write URL, text, or WiFi NDEF payloads.
+  Use when: You need to create NFC tags for demos or authorized workflows.
+
+nfc_reader.py
+  Path: payloads/nfc_rfid/nfc_reader.py
+  What it does: Reads general NFC tag details.
+  How it works: Polls for tags and displays UID/type/memory/record data.
+  Use when: You need a general NFC inspection tool.
+
+nfc_saved.py
+  Path: payloads/nfc_rfid/nfc_saved.py
+  What it does: Browses saved NFC dumps.
+  How it works: Reads, exports, and deletes files under loot/NFC/.
+  Use when: You need to review captured tag data on device.
+
+nfc_scanner.py
+  Path: payloads/nfc_rfid/nfc_scanner.py
+  What it does: Continuously scans for NFC tags.
+  How it works: Polls the PN532/reader and updates the LCD when tags appear.
+  Use when: You need a live NFC presence scanner.
+
+nfc_transport.py
+  Path: payloads/nfc_rfid/nfc_transport.py
+  What it does: Provides NFC transport/protocol tools.
+  How it works: Sends APDU or lower-level card transport commands.
+  Use when: You are debugging NFC protocol behavior.
+
+--------------------------------------------------------------------------------
+5.11 SDR/RADIO (5)
+--------------------------------------------------------------------------------
+
+sdr_adsb.py
+  Path: payloads/sdr/sdr_adsb.py
+  What it does: Tracks ADS-B aircraft signals.
+  How it works: Uses RTL-SDR with dump1090/rtl_adsb around 1090 MHz.
+  Use when: You want local aircraft signal reception.
+
+sdr_pocsag.py
+  Path: payloads/sdr/sdr_pocsag.py
+  What it does: Decodes POCSAG/FLEX pager signals.
+  How it works: Uses rtl_fm and multimon-ng style decoding.
+  Use when: You are monitoring authorized or legal pager test signals.
+
+sdr_replay.py
+  Path: payloads/sdr/sdr_replay.py
+  What it does: Captures and replays IQ/radio samples where hardware supports it.
+  How it works: Uses rtl_sdr/Soapy-style capture and optional TX tooling.
+  Use when: You are doing lab RF replay experiments.
+
+sdr_subghz.py
+  Path: payloads/sdr/sdr_subghz.py
+  What it does: Analyzes Sub-GHz ISM signals.
+  How it works: Uses rtl_433 across bands such as 315, 345, 433, 868, and 915 MHz.
+  Use when: You need to inspect sensors, remotes, and ISM-band devices.
+
+sdr_suite.py
+  Path: payloads/sdr/sdr_suite.py
+  What it does: Provides a general SDR suite.
+  How it works: Uses _sdr_core for waterfall, frequency control, IQ recording, and
+  scanner-style workflows.
+  Use when: You want a broad RTL-SDR control interface on the LCD.
+
+--------------------------------------------------------------------------------
+5.12 AI (4)
+--------------------------------------------------------------------------------
+
+birdnet.py
+  Path: payloads/ai/birdnet.py
+  What it does: Identifies bird species from audio.
+  How it works: Uses BirdNET/an audio model with a microphone or audio HAT.
+  Use when: You want field audio classification unrelated to network attacks.
+
+network_anomaly.py
+  Path: payloads/ai/network_anomaly.py
+  What it does: Detects anomalous network behavior.
+  How it works: Builds traffic-stat baselines and flags deviations.
+  Use when: You need lightweight local anomaly detection.
+
+object_detector.py
+  Path: payloads/ai/object_detector.py
+  What it does: Runs camera object detection.
+  How it works: Uses OpenCV/TFLite-style inference on Pi Camera or USB camera frames.
+  Use when: You need visual object detection from the device.
+
+speech_to_text.py
+  Path: payloads/ai/speech_to_text.py
+  What it does: Transcribes speech from a microphone.
+  How it works: Uses Whisper/Vosk-style speech recognition.
+  Use when: You need local or lightweight speech-to-text capture.
+
+--------------------------------------------------------------------------------
+5.13 HARDWARE (11)
+--------------------------------------------------------------------------------
+
+battery_monitor.py
+  Path: payloads/hardware/battery_monitor.py
+  What it does: Monitors battery/UPS voltage and status.
+  How it works: Reads ADC/I2C/sysfs data depending on installed hardware.
+  Use when: You need field power awareness.
+
+gpio_tripwire.py
+  Path: payloads/hardware/gpio_tripwire.py
+  What it does: Uses a GPIO sensor as a tripwire.
+  How it works: Monitors edge changes with debounce and displays/logs alerts.
+  Use when: You need a simple physical intrusion or movement trigger.
+
+gps_config.py
+  Path: payloads/hardware/gps_config.py
+  What it does: Configures GPS/gpsd.
+  How it works: Selects device/baud and writes or applies gpsd settings.
+  Use when: You need to prepare a GPS module for wardriving or tracking.
+
+gps_live.py
+  Path: payloads/hardware/gps_live.py
+  What it does: Shows live GPS coordinates.
+  How it works: Reads gpsd/NMEA data and displays fix status.
+  Use when: You need to verify GPS lock.
+
+gps_tracker.py
+  Path: payloads/hardware/gps_tracker.py
+  What it does: Logs GPS tracks.
+  How it works: Reads gpsd periodically and writes track logs.
+  Use when: You need movement history or route capture.
+
+i2c_scanner.py
+  Path: payloads/hardware/i2c_scanner.py
+  What it does: Scans the I2C bus.
+  How it works: Uses i2cdetect/smbus-style probing.
+  Use when: You need to verify attached I2C devices.
+
+imu_monitor.py
+  Path: payloads/hardware/imu_monitor.py
+  What it does: Displays IMU orientation/acceleration.
+  How it works: Reads LSM6DS3TR or compatible I2C IMU data.
+  Use when: You need motion/orientation diagnostics.
+
+led_control.py
+  Path: payloads/hardware/led_control.py
+  What it does: Controls HAT/status LEDs.
+  How it works: Uses GPIO/PWM patterns.
+  Use when: You need visual status or hardware test patterns.
+
+lte_configure.py
+  Path: payloads/hardware/lte_configure.py
+  What it does: Configures LTE/4G USB modems.
+  How it works: Uses ModemManager/mmcli/qmicli style commands.
+  Use when: You need cellular uplink setup.
+
+mobile_gps.py
+  Path: payloads/hardware/mobile_gps.py
+  What it does: Uses a phone as a GPS source.
+  How it works: Pairs over Bluetooth or consumes NMEA from a mobile source.
+  Use when: You lack a dedicated GPS module.
+
+nfc_reader.py
+  Path: payloads/hardware/nfc_reader.py
+  What it does: Tests PN532/NFC hardware.
+  How it works: Performs low-level reader detection and tag reads.
+  Use when: You need to verify NFC hardware before using NFC payloads.
+
+--------------------------------------------------------------------------------
+5.14 UTILITIES (75)
+--------------------------------------------------------------------------------
+
+alarm_clock.py
+  Path: payloads/utilities/alarm_clock.py
+  What it does: Provides an LCD alarm clock.
+  How it works: Uses local time, GPIO controls, and display updates.
+  Use when: You need a simple timed alert.
+
+auto_update.py
+  Path: payloads/utilities/auto_update.py
+  What it does: Updates RaspyJack from git.
+  How it works: Runs git/apt/update commands and can reboot if required.
+  Use when: You want on-device project updates.
+
+brightness.py
+  Path: payloads/utilities/brightness.py
+  What it does: Adjusts LCD brightness.
+  How it works: Uses display/backlight controls where supported.
+  Use when: You need screen visibility or power tuning.
+
+bt_keyboard_picker.py
+  Path: payloads/utilities/bt_keyboard_picker.py
+  What it does: Pairs/selects a Bluetooth keyboard.
+  How it works: Uses bluetoothctl pairing and device selection.
+  Use when: You need keyboard input without USB.
+
+button_combo.py
+  Path: payloads/utilities/button_combo.py
+  What it does: Maps button chord sequences to payload launches.
+  How it works: Reads combo configuration and dispatches configured payloads.
+  Use when: You want fast physical shortcuts.
+
+c2_dashboard.py
+  Path: payloads/utilities/c2_dashboard.py
+  What it does: Displays C2 session/config status.
+  How it works: Reads local C2 configuration and status files or endpoints.
+  Use when: You need an operator dashboard.
+
+calculator.py
+  Path: payloads/utilities/calculator.py
+  What it does: Provides an LCD calculator.
+  How it works: Uses button navigation and local expression logic.
+  Use when: You need a quick field calculator.
+
+camera.py
+  Path: payloads/utilities/camera.py
+  What it does: Previews or captures camera images.
+  How it works: Uses libcamera/raspistill/OpenCV-style camera access.
+  Use when: You need camera verification or snapshots.
+
+camera_setup.py
+  Path: payloads/utilities/camera_setup.py
+  What it does: Helps configure the camera module.
+  How it works: Runs camera test commands and setup checks.
+  Use when: Camera payloads need setup or troubleshooting.
+
+card_tester.py
+  Path: payloads/utilities/card_tester.py
+  What it does: Tests storage/card performance.
+  How it works: Uses dd/fio-style read/write checks.
+  Use when: You need to validate SD or USB media speed.
+
+cardputer_tuner.py
+  Path: payloads/utilities/cardputer_tuner.py
+  What it does: Tunes Cardputer keyboard mapping.
+  How it works: Reads TCA8418/I2C key events and helps map keys.
+  Use when: You are running on Cardputer-like hardware.
+
+client_access_mgr.py
+  Path: payloads/utilities/client_access_mgr.py
+  What it does: Manages WebUI client access tokens/users.
+  How it works: Edits local JSON access records.
+  Use when: You need to control WebUI access.
+
+display_image.py
+  Path: payloads/utilities/display_image.py
+  What it does: Displays image files on the LCD.
+  How it works: Loads images with Pillow and scales them to the screen.
+  Use when: You need local image viewing.
+
+display_selector.py
+  Path: payloads/utilities/display_selector.py
+  What it does: Switches display profiles.
+  How it works: Edits gui_conf.json display type/flip settings.
+  Use when: You change LCD hardware or orientation.
+
+engagement_timer.py
+  Path: payloads/utilities/engagement_timer.py
+  What it does: Provides a pentest engagement timer/stopwatch.
+  How it works: Tracks elapsed time and displays status.
+  Use when: You need field time tracking.
+
+espterminator.py
+  Path: payloads/utilities/espterminator.py
+  What it does: Detects or blocks rogue ESP8266/ESP32 APs.
+  How it works: Scans wireless signatures and can coordinate deauth behavior.
+  Use when: You are auditing rogue microcontroller APs.
+
+fast_wifi_connect.py
+  Path: payloads/utilities/fast_wifi_connect.py
+  What it does: Connects to the strongest saved WiFi.
+  How it works: Uses NetworkManager profiles and nmcli.
+  Use when: You need quick management WiFi connectivity.
+
+fast_wifi_switcher.py
+  Path: payloads/utilities/fast_wifi_switcher.py
+  What it does: Quickly switches between wlan0 and wlan1 roles.
+  How it works: Uses ip/nmcli and integration APIs.
+  Use when: You need to move management connectivity between adapters.
+
+favorites_manager.py
+  Path: payloads/utilities/favorites_manager.py
+  What it does: Manages favorite payloads.
+  How it works: Edits loot/Favorites/favorites.json and can launch favorites.
+  Use when: You want important payloads on the main menu.
+
+GPS_Doctor.py
+  Path: payloads/utilities/GPS_Doctor.py
+  What it does: Troubleshoots GPS hardware and gpsd.
+  How it works: Runs device, baud, gpsd, systemctl, gpsmon-style checks.
+  Use when: GPS payloads do not get a fix.
+
+gps_check.py
+  Path: payloads/utilities/gps_check.py
+  What it does: Performs a quick GPS fix check.
+  How it works: Reads gpsd/NMEA status and shows fix data.
+  Use when: You need fast GPS validation.
+
+gv_alerts.py
+  Path: payloads/utilities/gv_alerts.py
+  What it does: Sends webhook notification alerts.
+  How it works: Uses configured webhook URLs and HTTP POSTs.
+  Use when: You need device notifications to Discord or similar endpoints.
+
+hackstats_dashboard.py
+  Path: payloads/utilities/hackstats_dashboard.py
+  What it does: Aggregates attack statistics.
+  How it works: Parses multiple loot directories and summarizes counts.
+  Use when: You need a broad engagement status overview.
+
+handshake_sanitiser.py
+  Path: payloads/utilities/handshake_sanitiser.py
+  What it does: Cleans and deduplicates handshake captures.
+  How it works: Parses capture files and removes low-quality or duplicate data.
+  Use when: You need cleaner handshakes before cracking/uploading.
+
+hccapx_converter.py
+  Path: payloads/utilities/hccapx_converter.py
+  What it does: Converts capture files for hashcat.
+  How it works: Uses cap2hccapx/hcxpcapngtool style conversion.
+  Use when: You need hashcat-ready WPA material.
+
+hdmi_mirror.py
+  Path: payloads/utilities/hdmi_mirror.py
+  What it does: Mirrors the LCD to HDMI.
+  How it works: Copies or renders framebuffer/display output to HDMI.
+  Use when: You need a larger local display.
+
+hashtopolis_upload.py
+  Path: payloads/utilities/hashtopolis_upload.py
+  What it does: Uploads hashes to Hashtopolis.
+  How it works: Uses Hashtopolis API server URL/token configuration.
+  Use when: You use Hashtopolis for distributed cracking.
+
+hw_test.py
+  Path: payloads/utilities/hw_test.py
+  What it does: Runs broad hardware diagnostics.
+  How it works: Checks GPS, WiFi, Bluetooth, USB, GPIO, I2C, display, and system
+  probes.
+  Use when: You need to validate a RaspyJack build.
+
+icmp_alert.py
+  Path: payloads/utilities/icmp_alert.py
+  What it does: Alerts when hosts go up or down.
+  How it works: Polls targets with ping and triggers notifications.
+  Use when: You need basic host availability monitoring.
+
+iface_manager.py
+  Path: payloads/utilities/iface_manager.py
+  What it does: Manages network interfaces.
+  How it works: Uses ip/nmcli to up/down interfaces, show IPs, restore WiFi, and
+  manage modes.
+  Use when: Wireless or Ethernet state needs repair during an engagement.
+
+interface_status.py
+  Path: payloads/utilities/interface_status.py
+  What it does: Shows interface status and counters.
+  How it works: Reads sysfs statistics for eth/wlan interfaces.
+  Use when: You need live link and traffic counters.
+
+irc_chat.py
+  Path: payloads/utilities/irc_chat.py
+  What it does: Provides a minimal IRC client.
+  How it works: Uses socket IRC protocol and LCD input.
+  Use when: You need simple text chat from the device.
+
+iss_tracker.py
+  Path: payloads/utilities/iss_tracker.py
+  What it does: Tracks the International Space Station.
+  How it works: Uses public ISS APIs and displays current position.
+  Use when: You want a utility/demo payload.
+
+keyboard_tester.py
+  Path: payloads/utilities/keyboard_tester.py
+  What it does: Shows USB keyboard key events.
+  How it works: Reads evdev input devices.
+  Use when: You need to test keyboard input.
+
+LanTest.py
+  Path: payloads/utilities/LanTest.py
+  What it does: Tests LAN speed.
+  How it works: Uses iperf3 against configured servers.
+  Use when: You need local throughput validation.
+
+latency.py
+  Path: payloads/utilities/latency.py
+  What it does: Monitors RTT and jitter.
+  How it works: Runs ping/arping/TCP timing and renders sparklines.
+  Use when: You need live network latency diagnostics.
+
+loot_browser.py
+  Path: payloads/utilities/loot_browser.py
+  What it does: Browses loot directories on the LCD.
+  How it works: Displays files and text snippets from loot/.
+  Use when: You need to review results without WebUI/SSH.
+
+m5burner.py
+  Path: payloads/utilities/m5burner.py
+  What it does: Flashes M5Stack devices.
+  How it works: Uses esptool-style flashing against USB devices.
+  Use when: You need to program M5 hardware from RaspyJack.
+
+map_downloader.py
+  Path: payloads/utilities/map_downloader.py
+  What it does: Downloads offline map tiles.
+  How it works: Fetches tile ranges over HTTP.
+  Use when: Wardriving/map viewing needs offline map data.
+
+map_viewer.py
+  Path: payloads/utilities/map_viewer.py
+  What it does: Displays offline maps.
+  How it works: Loads cached tiles and overlays wardriving/GPS data.
+  Use when: You want visual location context on the LCD.
+
+morse_code.py
+  Path: payloads/utilities/morse_code.py
+  What it does: Encodes/decodes Morse code.
+  How it works: Uses buttons and LCD output for Morse interaction.
+  Use when: You want a simple utility/demo payload.
+
+net_tools.py
+  Path: payloads/utilities/net_tools.py
+  What it does: Provides common network tools.
+  How it works: Wraps ping, dig, traceroute, and related checks.
+  Use when: You need quick network troubleshooting.
+
+news_reader.py
+  Path: payloads/utilities/news_reader.py
+  What it does: Reads RSS/news feeds.
+  How it works: Fetches feed URLs and displays entries.
+  Use when: You want a general connected utility.
+
+notification_center.py
+  Path: payloads/utilities/notification_center.py
+  What it does: Shows an on-device notification inbox.
+  How it works: Reads notification JSON/files produced by other payloads.
+  Use when: You need to review alerts locally.
+
+package_installer.py
+  Path: payloads/utilities/package_installer.py
+  What it does: Installs packages from the LCD.
+  How it works: Wraps apt and pip3 workflows.
+  Use when: A payload reports missing dependencies.
+
+packet_replay.py
+  Path: payloads/utilities/packet_replay.py
+  What it does: Replays PCAP packets.
+  How it works: Uses Scapy sendp against a selected interface.
+  Use when: You are replaying authorized lab captures.
+
+password_generator.py
+  Path: payloads/utilities/password_generator.py
+  What it does: Generates random passwords.
+  How it works: Uses Python secrets and selected length/charset.
+  Use when: You need quick secure password generation.
+
+payload_scheduler.py
+  Path: payloads/utilities/payload_scheduler.py
+  What it does: Schedules payload execution.
+  How it works: Stores schedule rules and launches selected payloads at times.
+  Use when: You need unattended payload runs.
+
+payload_search.py
+  Path: payloads/utilities/payload_search.py
+  What it does: Searches all payloads by name/docstring.
+  How it works: Walks payloads/ and displays matching scripts.
+  Use when: The payload catalog is too large to browse manually.
+
+payload_updater.py
+  Path: payloads/utilities/payload_updater.py
+  What it does: Updates payloads and images from git.
+  How it works: Runs git pull/update logic for payload content.
+  Use when: You want only payload/resource updates.
+
+pcap_analyzer.py
+  Path: payloads/utilities/pcap_analyzer.py
+  What it does: Analyzes PCAP files on device.
+  How it works: Uses tshark/Scapy to summarize captures.
+  Use when: You need quick capture triage.
+
+port_alert.py
+  Path: payloads/utilities/port_alert.py
+  What it does: Alerts when new ports open.
+  How it works: Polls targets with nmap-like scans and compares state.
+  Use when: You need service-change monitoring.
+
+process_killer.py
+  Path: payloads/utilities/process_killer.py
+  What it does: Kills or manages local processes.
+  How it works: Uses ps, pgrep, and kill.
+  Use when: A stale tool or payload subprocess needs cleanup.
+
+qr_generator.py
+  Path: payloads/utilities/qr_generator.py
+  What it does: Displays QR codes.
+  How it works: Generates QR images from entered text.
+  Use when: You need to share URLs, WiFi strings, or tokens visually.
+
+qr_scanner.py
+  Path: payloads/utilities/qr_scanner.py
+  What it does: Scans QR/barcodes from a camera.
+  How it works: Uses OpenCV and pyzbar-style decoding.
+  Use when: You need to read QR codes in the field.
+
+ragnar.py
+  Path: payloads/utilities/ragnar.py
+  What it does: Launches and controls the vendored Ragnar stack.
+  How it works: Starts the vendor/ragnar web stack on port 8091 and shows status.
+  Use when: You want the Ragnar interface from RaspyJack.
+
+serial_terminal.py
+  Path: payloads/utilities/serial_terminal.py
+  What it does: Provides a multi-port serial terminal.
+  How it works: Lists ttyUSB/ttyACM/UART devices and uses pyserial.
+  Use when: You need serial access to embedded devices.
+
+skimmer_scanner.py
+  Path: payloads/utilities/skimmer_scanner.py
+  What it does: Scans for BLE skimmer signatures.
+  How it works: Looks for known BLE names, UUIDs, and advertisement patterns.
+  Use when: You are checking for known skimmer-like devices.
+
+strip_clients.py
+  Path: payloads/utilities/strip_clients.py
+  What it does: Deauthenticates clients from an AP.
+  How it works: Uses aireplay-ng against a selected BSSID.
+  Use when: You are testing client/AP resilience with authorization.
+
+surveillance.py
+  Path: payloads/utilities/surveillance.py
+  What it does: Runs motion-triggered camera surveillance.
+  How it works: Uses camera/motion detection and stores captures.
+  Use when: You need local motion detection.
+
+system_monitor.py
+  Path: payloads/utilities/system_monitor.py
+  What it does: Displays CPU/RAM/temp/uptime.
+  How it works: Reads /proc and thermal/sysfs data.
+  Use when: You need device health monitoring.
+
+tape_recorder.py
+  Path: payloads/utilities/tape_recorder.py
+  What it does: Records and plays audio.
+  How it works: Uses arecord/aplay or audio helper functions.
+  Use when: You need audio capture/playback testing.
+
+test_ble_wait_for_present.py
+  Path: payloads/utilities/test_ble_wait_for_present.py
+  What it does: Tests EXTENSIONS WAIT_FOR_PRESENT BLE gates.
+  How it works: Uses EXTENSIONS.api with a BLE device name trigger.
+  Use when: You are validating extension trigger behavior.
+
+trigger_marker.py
+  Path: payloads/utilities/trigger_marker.py
+  What it does: Writes a marker when triggered.
+  How it works: Appends to a log for extension/automation tests.
+  Use when: You need a minimal payload for trigger validation.
+
+translator.py
+  Path: payloads/utilities/translator.py
+  What it does: Translates text.
+  How it works: Uses HTTP translation APIs and LCD input.
+  Use when: You need quick translation from the device.
+
+usb_unmount.py
+  Path: payloads/utilities/usb_unmount.py
+  What it does: Safely unmounts USB drives.
+  How it works: Uses lsblk/umount workflows.
+  Use when: You need to remove USB media safely.
+
+video_player.py
+  Path: payloads/utilities/video_player.py
+  What it does: Plays videos on the LCD.
+  How it works: Uses ffmpeg to decode and downscale frames.
+  Use when: You need local video playback.
+
+WanTest.py
+  Path: payloads/utilities/WanTest.py
+  What it does: Tests internet/WAN speed.
+  How it works: Uses speedtest-cli/Ookla style tooling.
+  Use when: You need uplink performance data.
+
+weather.py
+  Path: payloads/utilities/weather.py
+  What it does: Shows weather.
+  How it works: Uses weather HTTP APIs and configured location/key data.
+  Use when: You need a connected utility/demo.
+
+webui.py
+  Path: payloads/utilities/webui.py
+  What it does: Shows or controls WebUI access information.
+  How it works: Displays HTTP/HTTPS URLs and WebUI status from interface IPs.
+  Use when: You need the WebUI address on the LCD.
+
+wifi_dongle_installer.py
+  Path: payloads/utilities/wifi_dongle_installer.py
+  What it does: Installs drivers for USB WiFi dongles.
+  How it works: Detects USB chipsets, maps them to DKMS/apt packages, and can
+  run monitor tests.
+  Use when: An external WiFi adapter is not ready for monitor/AP/injection work.
+
+wifi_manager_payload.py
+  Path: payloads/utilities/wifi_manager_payload.py
+  What it does: Provides the full LCD WiFi manager.
+  How it works: Uses nmcli/iw and profiles under ~/.Raspyjack/wifi/.
+  Use when: You need to scan, connect, save, or manage WiFi from the LCD.
+
+WigleStats.py
+  Path: payloads/utilities/WigleStats.py
+  What it does: Displays WiGLE upload/statistics data.
+  How it works: Uses WiGLE API credentials and HTTP requests.
+  Use when: You want wardriving upload/account stats.
+
+winamp_player.py
+  Path: payloads/utilities/winamp_player.py
+  What it does: Plays MP3/audio with a Winamp-style UI.
+  How it works: Uses mpg123/ffmpeg and playlist handling.
+  Use when: You want local audio playback.
+
+youtube.py
+  Path: payloads/utilities/youtube.py
+  What it does: Plays YouTube audio or streams.
+  How it works: Uses yt-dlp and ffmpeg.
+  Use when: You want online media playback from the device.
+
+--------------------------------------------------------------------------------
+5.15 GAMES (33)
+--------------------------------------------------------------------------------
+
+All games are launched from Payload -> Games. They are primarily LCD/GPIO
+payloads and should exit with KEY3. Some require extra hardware or packages.
+
+1988.py
+  Path: payloads/games/1988.py
+  What it does: Runs a retro arcade mini-collection.
+  How it works: Uses LCD drawing, button input, and local game loops.
+  Use when: You want a quick display/input demo or downtime game.
+
+2048.py
+  Path: payloads/games/2048.py
+  What it does: Runs the 2048 sliding tile puzzle.
+  How it works: Uses directional buttons to merge tiles and redraws the board.
+  Use when: You want a compact puzzle game and input test.
+
+asteroids.py
+  Path: payloads/games/asteroids.py
+  What it does: Runs an Asteroids-style shooter.
+  How it works: Uses sprite movement, collision checks, and button controls.
+  Use when: You want to test animation and directional responsiveness.
+
+bomberman.py
+  Path: payloads/games/bomberman.py
+  What it does: Runs a Bomberman-style maze game.
+  How it works: Uses grid movement, bombs, collision, and LCD redraws.
+  Use when: You want a local arcade game on the device.
+
+boy_emulator.py
+  Path: payloads/games/boy_emulator.py
+  What it does: Runs a Game Boy/Game Boy Color emulator.
+  How it works: Uses PyBoy and ROM files, then maps controls to device input.
+  Use when: You have legal ROMs and want emulator testing on RaspyJack.
+
+Breakout.py
+  Path: payloads/games/Breakout.py
+  What it does: Runs a brick breaker game.
+  How it works: Moves a paddle and ball with collision against bricks.
+  Use when: You want simple LCD arcade gameplay.
+
+caveexpress.py
+  Path: payloads/games/caveexpress.py
+  What it does: Runs a Cave Express style platform game.
+  How it works: Uses local physics, hazards, and screen drawing.
+  Use when: You want a more involved platform demo.
+
+connect4.py
+  Path: payloads/games/connect4.py
+  What it does: Runs Connect Four.
+  How it works: Uses button-selected columns and an AI opponent.
+  Use when: You want a turn-based game with board rendering.
+
+conways_game_of_life.py
+  Path: payloads/games/conways_game_of_life.py
+  What it does: Runs Conway's Game of Life.
+  How it works: Evolves a cellular automaton and redraws generations.
+  Use when: You want a passive display/demo payload.
+
+cyber_swarm.py
+  Path: payloads/games/cyber_swarm.py
+  What it does: Runs a cyber-themed shooter.
+  How it works: Uses enemies, projectiles, collision, and local game state.
+  Use when: You want an arcade-style LCD stress test.
+
+doom.py
+  Path: payloads/games/doom.py
+  What it does: Runs a Doom/FreeDoom style game.
+  How it works: Uses game assets/engine integration and keyboard-style controls.
+  Use when: You are testing Cardputer keyboard mapping or novelty game support.
+
+doodle_jump.py
+  Path: payloads/games/doodle_jump.py
+  What it does: Runs a Doodle Jump style vertical platformer.
+  How it works: Uses button or optional IMU tilt control, platforms, and scrolling.
+  Use when: You want to test motion/input game behavior.
+
+firewall_defense.py
+  Path: payloads/games/firewall_defense.py
+  What it does: Runs a network-themed tower defense game.
+  How it works: Uses waves, defenses, and LCD state rendering.
+  Use when: You want a themed game payload.
+
+flappy.py
+  Path: payloads/games/flappy.py
+  What it does: Runs a Flappy Bird style game.
+  How it works: Uses timed gravity/jump logic and obstacle collision.
+  Use when: You want a simple one-button reflex game.
+
+frogger.py
+  Path: payloads/games/frogger.py
+  What it does: Runs a Frogger clone.
+  How it works: Uses grid movement, hazards, and goal tracking.
+  Use when: You want directional control gameplay.
+
+glitch_runner.py
+  Path: payloads/games/glitch_runner.py
+  What it does: Runs a cyberpunk runner/platformer.
+  How it works: Uses scrolling obstacles, jumps, and LCD animation.
+  Use when: You want a fast animation/game demo.
+
+labyrinth.py
+  Path: payloads/games/labyrinth.py
+  What it does: Runs a procedural maze game.
+  How it works: Generates mazes and lets the user navigate with buttons.
+  Use when: You want puzzle navigation on the LCD.
+
+lemmings.py
+  Path: payloads/games/lemmings.py
+  What it does: Runs a Lemmings/Pingus-style puzzle game.
+  How it works: Simulates characters and interactions with level geometry.
+  Use when: You want a more complex LCD game payload.
+
+marble_maze.py
+  Path: payloads/games/marble_maze.py
+  What it does: Runs a marble maze game.
+  How it works: Uses button or optional IMU tilt control and collision checks.
+  Use when: You want to test IMU-driven gameplay.
+
+minesweeper.py
+  Path: payloads/games/minesweeper.py
+  What it does: Runs Minesweeper.
+  How it works: Uses cursor movement, tile reveal/flag logic, and board rendering.
+  Use when: You want a compact puzzle game.
+
+neon_bikes.py
+  Path: payloads/games/neon_bikes.py
+  What it does: Runs a Tron light-cycle style game.
+  How it works: Tracks trails, collisions, and directional movement.
+  Use when: You want a high-contrast arcade game.
+
+opentyrian.py
+  Path: payloads/games/opentyrian.py
+  What it does: Runs an OpenTyrian-style shooter.
+  How it works: Uses local shooter mechanics and display rendering.
+  Use when: You want a richer arcade payload.
+
+pacman.py
+  Path: payloads/games/pacman.py
+  What it does: Runs a Pac-Man clone.
+  How it works: Uses maze movement, pellets, ghost behavior, and collision.
+  Use when: You want classic arcade gameplay.
+
+pong.py
+  Path: payloads/games/pong.py
+  What it does: Runs Pong.
+  How it works: Moves paddles/ball and tracks scores.
+  Use when: You want a minimal game/input demo.
+
+puzzle.py
+  Path: payloads/games/puzzle.py
+  What it does: Runs a 15-puzzle sliding game.
+  How it works: Uses tile movement and board redraws.
+  Use when: You want a simple puzzle payload.
+
+simon.py
+  Path: payloads/games/simon.py
+  What it does: Runs a Simon memory game.
+  How it works: Shows button/color sequences and checks user repetition.
+  Use when: You want a memory and button-response game.
+
+snake.py
+  Path: payloads/games/snake.py
+  What it does: Runs Snake.
+  How it works: Uses directional movement, food, growth, and wall/body collision.
+  Use when: You want a simple, reliable game payload.
+
+sokoban.py
+  Path: payloads/games/sokoban.py
+  What it does: Runs Sokoban.
+  How it works: Uses grid movement and box-pushing puzzle rules.
+  Use when: You want a thoughtful puzzle game.
+
+space_invaders.py
+  Path: payloads/games/space_invaders.py
+  What it does: Runs a Space Invaders clone.
+  How it works: Uses enemy waves, projectiles, player movement, and collisions.
+  Use when: You want classic shooter gameplay.
+
+tetris.py
+  Path: payloads/games/tetris.py
+  What it does: Runs Tetris.
+  How it works: Uses falling pieces, rotation, line clears, and scoring.
+  Use when: You want a classic LCD puzzle game.
+
+text_adventure.py
+  Path: payloads/games/text_adventure.py
+  What it does: Runs a text adventure.
+  How it works: Uses local/remote text entry and displays narrative state.
+  Use when: You want to test text input and longer LCD interactions.
+
+tictactoe.py
+  Path: payloads/games/tictactoe.py
+  What it does: Runs Tic-tac-toe.
+  How it works: Uses cursor selection and an AI/minimax opponent.
+  Use when: You want a small board game with simple AI.
+
+war.py
+  Path: payloads/games/war.py
+  What it does: Runs a network-themed War card game.
+  How it works: Uses card state, rounds, and LCD score display.
+  Use when: You want a lightweight themed card game.
+
+--------------------------------------------------------------------------------
+5.16 EXAMPLES (2)
+--------------------------------------------------------------------------------
+
+_payload_template.py
+  Path: payloads/examples/_payload_template.py
+  What it does: Provides the current starter template for new payloads.
+  How it works: Demonstrates ScaledDraw, scaled_font, get_button, lcd_keyboard,
+  GPIO/LCD initialization, and KEY3 exit.
+  Use when: You are creating a new payload.
+
+example_show_buttons.py
+  Path: payloads/examples/example_show_buttons.py
+  What it does: Demonstrates button input on screen.
+  How it works: Polls get_button() and displays pressed controls.
+  Use when: You need a minimal input tutorial or hardware test.
+
+================================================================================
+6. SHARED HELPERS THAT ARE NOT PAYLOADS
+================================================================================
+
+payloads/_input_helper.py
+  Unified input bridge. It checks WebUI virtual buttons first, then GPIO. It also
+  supports held-button state, input flushing, display flip mapping, and remote
+  text sessions.
+
+payloads/_display_helper.py
+  Resolution scaling layer. Design screens in 128-base coordinates; ScaledDraw
+  scales drawing calls to the active LCD profile.
+
+payloads/_keyboard_helper.py
+  On-screen keyboard with full, alpha, digits, IP, hex, MAC, and URL charsets.
+  KEY1 switches page, KEY2 backspaces, KEY3 cancels, OK types/accepts.
+
+payloads/_iface_helper.py
+  Interface discovery and LCD picker. It identifies onboard WiFi, USB WiFi,
+  Ethernet, AP support, monitor support, driver names, IP addresses, and state.
+
+payloads/_gps_helper.py
+  GPS autodetection and gpsd startup. It handles USB GPS, UART GPS, baud probing,
+  serial-getty release, and gpsd verification.
+
+payloads/_janos_helper.py
+  JanOS UART transport. It detects JanOS devices using ping/pong, manages serial
+  line reading, and parses WiFi/BLE results.
+
+payloads/_audio_helper.py
+  Audio helper functions for playback/recording payloads.
+
+payloads/nfc_rfid/_nfc_driver.py
+  PN532 driver and transport support for NFC/RFID payloads.
+
+payloads/nfc_rfid/_nfc_cards.py and _nfc_keys.py
+  NFC card/key reference data and helper logic.
+
+payloads/sdr/_sdr_core.py, _waterfall.py, _presets.py
+  SDR detection, capture, FFT, waterfall rendering, and frequency presets.
+
+================================================================================
+7. CREATING PAYLOADS - SHORT REFERENCE
+================================================================================
+
+Use payloads/examples/_payload_template.py as the starting point. For the full
+project skill, see .cursor/skills/raspyjack-payload-authoring/SKILL.md.
+
+Required behavior:
+- Place the file under payloads/<category>/<name>.py.
+- Do not start the filename with "_" unless it is a helper.
+- Use _input_helper.get_button() for every interactive loop.
+- Use KEY3 as exit.
+- Use _display_helper.ScaledDraw and scaled_font for screen drawing.
+- Use _keyboard_helper.lcd_keyboard for text entry.
+- Use _iface_helper.select_interface for WiFi/Ethernet selection.
+- Keep the UI loop responsive; long work belongs in a worker thread or subprocess
+  with cooperative cancellation.
+- Write durable results under loot/<PayloadName>/ or an existing category loot
+  directory.
+- Let stdout/stderr go to loot/payload.log for diagnostics.
+- Clean up monitor mode, AP mode, gpsd/hostapd/dnsmasq/tcpdump/rtl_* processes,
+  GPIO, and LCD state before exit.
+
+Optional integration:
+- Add an icon to menu_icons.json under the payloads section, keyed by the display
+  label with a leading space, for example " deauth".
+- Use EXTENSIONS.api only when a payload needs reusable trigger/action gates.
+- Use Favorites Manager for operator shortcuts instead of hardcoding top-level
+  menu entries.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+================================================================================
               RASPYJACK — KOMPLETNA DOKUMENTACJA PROJEKTU
 ================================================================================
 Wygenerowano: 2026-03-12
